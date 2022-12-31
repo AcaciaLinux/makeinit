@@ -1,0 +1,168 @@
+#!/bin/sh
+
+PATH=/usr/bin:/usr/sbin
+export PATH
+
+mkdir /.root
+
+#
+# find device by uuid
+# 
+find_device_by_uuid() {
+  local uuid=$1
+
+  # Use blkid to find the device associated with the given UUID
+  local device=$(blkid -U "$uuid")
+
+  # Return the device if it was found
+  if [ -n "$device" ]; then
+    echo "$device"
+    return 0
+  else
+    >&2 log "Error: No device found with UUID $uuid"
+    shell_on_error
+    return 1
+  fi
+}
+
+#
+# mount rootfs
+#
+mount_root()
+{
+  local identifier=$1
+
+  # Check if the identifier is a UUID, a device name, or the SQUASH option
+  if [[ "$identifier" =~ ^UUID= ]]; then
+    local uuid=${identifier#UUID=}
+    local device=$(find_device_by_uuid "$uuid")
+    mount "$device" /.root
+
+  elif [[ "$identifier" =~ ^DEV= ]]; then
+    local device=${identifier#DEV=}
+    mount "$device" /.root
+
+  elif [[ "$identifier" == "SQUASH" ]]; then
+    mount_squash_root
+    return 0
+  else
+    >&2 log "Error: Invalid identifier format. Must be either UUID=, DEV=, or SQUASH"
+    shell_on_error
+    return 1
+  fi
+
+}
+
+#
+# Spawns a shell on Error
+#
+shell_on_error()
+{	
+	log "Something went wrong. Dropping you to a shell."
+	log "The system will attempt to continue booting after you exit this shell."
+	log "Good luck."
+	/usr/bin/sh
+}
+
+#
+# Attempts to mount a squashfs root filesystem at /ramfs/dvd/01-core.sb
+# 
+mount_squash_root()
+{
+   log "Setting up squashroot.."
+   mkdir /ramfs/
+   
+   mount -t tmpfs -o size=512m tmpfs /ramfs/
+
+   mkdir -p /ramfs/dvd
+   mkdir -p /ramfs/realroot
+   mkdir -p /ramfs/changes
+   mkdir -p /ramfs/workdir
+	
+   log "Mounting dvd.."
+   mount -o loop /dev/sr0 /ramfs/dvd/
+   log "Mounting squashfs.."
+   mount -o loop,ro -t squashfs /ramfs/dvd/01-core.sb /ramfs/realroot
+   log "Mounting overlayfs.."
+   mount -t overlay overlay -o lowerdir=/ramfs/realroot,upperdir=/ramfs/changes,workdir=/ramfs/workdir /.root
+   log "OverlayFS root mounted to /.root"
+}
+
+#
+# logs to stdout
+#
+log() {
+    log_prefix="[acacia-initramfs]"
+    echo "$log_prefix $1"
+}
+
+log "Loading.."
+init=/sbin/init
+root=
+rootdelay=
+rootfstype=auto
+ro="ro"
+rootflags=
+device=
+resume=
+noresume=false
+
+log "Mounting kernel filesystems.."
+mount -n -t devtmpfs devtmpfs /dev
+mount -n -t proc     proc     /proc
+mount -n -t sysfs    sysfs    /sys
+mount -n -t tmpfs    tmpfs    /run
+
+log "Parsing kernel parameters.."
+read -r cmdline < /proc/cmdline
+
+for param in $cmdline ; do
+  case $param in
+    init=*      ) init=${param#init=}             ;;
+    root=*      ) root=${param#root=}             ;;
+    rootdelay=* ) rootdelay=${param#rootdelay=}   ;;
+    rootfstype=*) rootfstype=${param#rootfstype=} ;;
+    rootflags=* ) rootflags=${param#rootflags=}   ;;
+    resume=*    ) resume=${param#resume=}         ;;
+    noresume    ) noresume=true                   ;;
+    ro          ) ro="ro"                         ;;
+    rw          ) ro="rw"                         ;;
+  esac
+done
+
+log "Attempting to mount root on $root .."
+
+log "Loading device drivers.."
+source /loadmodules
+
+for kmod in "${KMODULES[@]}"; do
+	modprobe "$kmod"
+done
+
+
+log "Launching systemd-udevd.."
+/usr/lib/systemd/systemd-udevd --daemon --resolve-names=never
+log "Triggering uevents.."
+udevadm trigger
+log "Waiting for uevents to settle.."
+udevadm settle
+log "uevents settled."
+
+log "Attempting to mount root.."
+mount_root $root
+
+#do_try_resume # This function will not return if resuming from disk
+#do_mount_root
+
+
+log "Preparing to handoff to systemd.."
+killall -w systemd-udevd
+
+if [[ "$cmdline" == *"initrdshell"* ]]; then
+	log "Shell requested by kernel parameter. Dropping you to a shell."
+	log "Good luck."
+	/usr/bin/sh
+fi
+
+log "Switching root and executing systemd!"
+exec switch_root /.root "$init" "$@"
